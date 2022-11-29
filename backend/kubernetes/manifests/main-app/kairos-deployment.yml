@@ -1,0 +1,26 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kairos-deployment
+  namespace: kairos
+  labels:
+    app: kairos
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: kairos
+  template:
+    metadata:
+      labels:
+        app: kairos
+    spec:
+      containers:
+      # Removed Account ID for security reaons
+      - name: kairos
+        image: 1234567890.dkr.ecr.ap-southeast-1.amazonaws.com/kairos-backend:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8000
+      imagePullSecrets:
+      - name: ecr-credentials

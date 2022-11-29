@@ -1,0 +1,111 @@
+stages: 
+  - infrastructure
+  - build
+  - test
+  - upload
+  - deploy
+
+image: ubuntu:latest
+
+variables:
+  AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+  AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+  AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+
+infrastructure-init:
+  stage: infrastructure
+  image:
+    name: hashicorp/terraform:latest
+    entrypoint: ["/usr/bin/env"]
+  before_script:
+    - cd backend/terraform
+    - terraform init
+  script:
+    - terraform apply --auto-approve
+
+build-job:
+  stage: build
+  image: docker:20.10.21
+  services:
+    - docker:20.10.21-dind
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+  script:
+    # Builds an image with instructions and files in specified directory and save it into a tar.gz format
+    - docker build -t kairos backend/app
+    - docker save kairos | gzip > kairos.tar.gz
+  artifacts:
+    paths:
+      - kairos.tar.gz
+
+lint-job:
+  stage: test
+  image: python:slim
+  before_script:
+    - apt update
+    - apt install gcc -y
+    - pip install -r backend/app/requirements.txt
+    - pip install pylint
+  script:
+    # pylint possible fail-on categories (comma separated) - C,R,W,E,F
+    # pylint fail-under evaluation score set to 0
+    - pylint --fail-on=F --fail-under=0 --output-format=json:lint-report.json backend/app/*/*.py backend/app/*.py
+  artifacts:
+    when: always
+    paths:
+      - lint-report.json
+
+container-scanning:
+  stage: test
+  image:
+    name: aquasec/trivy:latest
+    entrypoint: [""]
+  variables:
+    TRIVY_VERSION: latest
+    SCAN_TARGET: kairos.tar.gz
+    REPORT_NAME: trivy-scan-report
+    # comma separated values without whitespace in-between - possible values: UNKNOWN, LOW, MEDIUM, HIGH, CRITICAL
+    REPORT_LEVELS: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+    # fail stage on detection of specified levels of vulnerability
+    FAIL_LEVELS: UNKNOWN
+  script:
+    # Decides command to scan based on SCAN_TARGET (image from registry URL or .tar or .tar.gz format)
+    - |
+      OPTS=$SCAN_TARGET
+      if [[ "$SCAN_TARGET" == *.tar ]] || [[ "$SCAN_TARGET" == *.tar.gz ]]
+      then
+          OPTS="--input $SCAN_TARGET"
+      fi
+      trivy image --severity $REPORT_LEVELS --exit-code 0 --format template --template "@/contrib/gitlab.tpl" --output $REPORT_NAME.json $OPTS
+  artifacts:
+    when: always
+    name: $REPORT_NAME
+    paths:
+      - $REPORT_NAME.json
+
+upload-image:
+  stage: upload
+  image: docker:20.10.21
+  services:
+    - docker:20.10.21-dind
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+    REGISTRY: 731706226892.dkr.ecr.ap-southeast-1.amazonaws.com
+  before_script:
+    - apk add --no-cache python3 py3-pip
+    - pip3 install --no-cache-dir awscli
+  script:
+    - aws ecr get-login-password --region ap-southeast-1 | docker login --username AWS --password-stdin $REGISTRY
+    - docker load < kairos.tar.gz
+    - docker images
+    - docker tag kairos $REGISTRY/kairos-backend:latest
+    - docker push $REGISTRY/kairos-backend:latest
+
+deploy-job:
+  stage: deploy
+  image: odaniait/aws-kubectl:latest
+  script:
+    - aws eks update-kubeconfig --name kairos
+    - kubectl rollout restart deployment/kairos-deployment -n kairos
